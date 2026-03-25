@@ -5,16 +5,20 @@
 功能:
   - 从研招网搜索并拉取招生院校列表
   - 支持按省份/学科门类过滤
-  - 将结果保存为 CSV 和 JSON 文件
+  - 将结果保存为 CSV、JSON 或 Excel（.xlsx）文件
 """
 
 import csv
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 import requests
 from bs4 import BeautifulSoup
 
@@ -232,6 +236,127 @@ def save_json(data: list[dict], filepath: str | Path) -> None:
     logger.info("已保存 JSON: %s", filepath)
 
 
+# 列标题中英对照
+COLUMN_LABELS = {
+    "序号": "No.",
+    "院校名称": "Institution Name",
+    "所在省份": "Province",
+    "院校类型": "Category",
+    "管理部门": "Authority",
+    "985工程": "985",
+    "211工程": "211",
+    "双一流": "Double First-Class",
+    "研招网链接": "Admission URL",
+    "数据更新时间": "Last Updated",
+}
+
+# 表头背景色（深蓝）
+HEADER_FILL = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+# 交替行背景色（浅蓝）
+ALT_ROW_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+HEADER_FONT = Font(bold=True, color="FFFFFF", name="微软雅黑", size=11)
+DATA_FONT = Font(name="微软雅黑", size=10)
+
+
+def save_excel(data: list[dict], filepath: str | Path) -> None:
+    """
+    将院校数据保存为格式化的 Excel (.xlsx) 文件。
+
+    工作表结构：
+      - 第1行：中文列标题（加粗，深蓝背景，白色字体）
+      - 第2行：英文列标题（辅助说明）
+      - 第3行起：数据，奇偶行交替背景色
+      - 所有列已冻结首行，设置自动筛选，可直接在 Excel 中排序/过滤
+
+    :param data: 院校信息字典列表
+    :param filepath: 输出文件路径（.xlsx）
+    """
+    filepath = Path(filepath)
+    if not data:
+        logger.warning("数据为空，跳过 Excel 保存")
+        return
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "研招网院校数据"
+
+    cn_headers = list(COLUMN_LABELS.keys())
+    en_headers = list(COLUMN_LABELS.values())
+
+    # 写入中文标题行（第1行）
+    for col_idx, header in enumerate(cn_headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # 写入英文副标题行（第2行，浅灰背景）
+    sub_fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    sub_font = Font(bold=False, color="1F4E79", name="微软雅黑", size=9, italic=True)
+    for col_idx, header in enumerate(en_headers, start=1):
+        cell = ws.cell(row=2, column=col_idx, value=header)
+        cell.font = sub_font
+        cell.fill = sub_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 内部字段名 -> 列索引映射
+    field_map = {
+        "序号": None,          # 自动计算
+        "院校名称": "name",
+        "所在省份": "province",
+        "院校类型": "category",
+        "管理部门": "authority",
+        "985工程": "985",
+        "211工程": "211",
+        "双一流": "double_first_class",
+        "研招网链接": "url",
+        "数据更新时间": "fetch_time",
+    }
+
+    # 写入数据行（从第3行开始）
+    for row_idx, item in enumerate(data, start=1):
+        excel_row = row_idx + 2
+        fill = ALT_ROW_FILL if row_idx % 2 == 0 else None
+
+        for col_idx, cn_header in enumerate(cn_headers, start=1):
+            field = field_map[cn_header]
+            if field is None:
+                value = row_idx
+            else:
+                value = item.get(field, "")
+
+            cell = ws.cell(row=excel_row, column=col_idx, value=value)
+            cell.font = DATA_FONT
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            if fill:
+                cell.fill = fill
+
+            # 链接列设为超链接样式
+            if cn_header == "研招网链接" and value:
+                cell.hyperlink = str(value)
+                cell.font = Font(color="0563C1", underline="single", name="微软雅黑", size=10)
+
+    # 设置列宽
+    col_widths = {1: 6, 2: 22, 3: 8, 4: 8, 5: 14, 6: 6, 7: 6, 8: 10, 9: 50, 10: 18}
+    for col_idx, width in col_widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # 设置行高
+    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[2].height = 16
+
+    # 冻结前两行（标题 + 副标题）
+    ws.freeze_panes = "A3"
+
+    # 自动筛选（从第1行开始，覆盖所有数据列）
+    last_col = get_column_letter(len(cn_headers))
+    last_row = len(data) + 2
+    ws.auto_filter.ref = f"A1:{last_col}{last_row}"
+
+    wb.save(filepath)
+    logger.info("已保存 Excel: %s（共 %d 所院校）", filepath, len(data))
+
+
 def main() -> None:
     """命令行入口：爬取全国院校数据并保存到当前目录。"""
     import argparse
@@ -261,6 +386,12 @@ def main() -> None:
         default=".",
         help="结果文件保存目录（默认：当前目录）",
     )
+    parser.add_argument(
+        "--excel",
+        action="store_true",
+        default=True,
+        help="同时保存为 Excel 文件（默认：True）",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -275,6 +406,8 @@ def main() -> None:
     if data:
         save_csv(data, output_dir / "institutions.csv")
         save_json(data, output_dir / "institutions.json")
+        if args.excel:
+            save_excel(data, output_dir / "institutions.xlsx")
     else:
         logger.warning("未获取到任何数据，请检查网络或网站结构是否有变化")
 
